@@ -9,12 +9,19 @@ import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct ReviewLaunch: Identifiable {
+    let id = UUID()
+    let questions: [StudyQuestion]
+}
+
 struct LibraryView: View {
     @Environment(TeacherStore.self) private var teacherStore
+    @Environment(ReviewStore.self) private var reviewStore
 
     @State private var library = DocumentLibrary()
     @State private var isImporting = false
     @State private var isTeacherSettingsPresented = false
+    @State private var reviewLaunch: ReviewLaunch?
     @State private var errorMessage: String?
 
     private let columns = [GridItem(.adaptive(minimum: 148, maximum: 220), spacing: 16)]
@@ -24,6 +31,15 @@ struct LibraryView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     teacherCard
+
+                    // Re-evaluate the "due" dates periodically even if the
+                    // library stays open and nothing else changes.
+                    if reviewStore.totalCount > 0 {
+                        TimelineView(.periodic(from: .now, by: 60)) { _ in
+                            reviewSection
+                        }
+                    }
+
                     documentsSection
                 }
                 .padding(.horizontal, 16)
@@ -31,6 +47,11 @@ struct LibraryView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("La mia libreria")
+            .onAppear {
+                // Refresh when coming back from the reader so edited PDFs
+                // update their page count, date and thumbnail.
+                library.refresh()
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -50,6 +71,21 @@ struct LibraryView: View {
             }
             .sheet(isPresented: $isTeacherSettingsPresented) {
                 TeacherSettingsView()
+            }
+            .sheet(item: $reviewLaunch) { launch in
+                StudySessionView(
+                    questions: launch.questions,
+                    teacher: teacherStore.profile,
+                    documentTitle: "Ripasso errori",
+                    isReview: true,
+                    onAnswered: { question, correct in
+                        reviewStore.gradeReview(
+                            prompt: question.prompt,
+                            documentTitle: question.topic ?? "",
+                            correct: correct
+                        )
+                    }
+                )
             }
             .navigationDestination(for: LibraryDocument.self) { document in
                 PDFReaderView(item: document)
@@ -114,6 +150,59 @@ struct LibraryView: View {
         .accessibilityHint("Personalizza nome e aspetto del Teacher")
     }
 
+    // MARK: - Review
+
+    private var reviewSection: some View {
+        Group {
+            if reviewStore.totalCount > 0 {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Ripasso")
+                        .font(.title2.bold())
+
+                    HStack(spacing: 12) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.indigo)
+                            .frame(width: 38, height: 38)
+                            .background(Color.indigo.opacity(0.12), in: Circle())
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            if reviewStore.dueCount > 0 {
+                                Text("\(reviewStore.dueCount) \(reviewStore.dueCount == 1 ? "domanda da ripassare" : "domande da ripassare")")
+                                    .font(.subheadline.weight(.semibold))
+                                Text("Gli errori tornano finché non li sai.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("Tutto ripassato")
+                                    .font(.subheadline.weight(.semibold))
+                                if let nextDueDate = reviewStore.nextDueDate {
+                                    Text("Prossimo ripasso: \(nextDueDate.formatted(date: .abbreviated, time: .omitted))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        Spacer(minLength: 8)
+
+                        if reviewStore.dueCount > 0 {
+                            Button("Ripassa") {
+                                startReview()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    .padding(14)
+                    .background(
+                        Color(uiColor: .secondarySystemGroupedBackground),
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    )
+                }
+            }
+        }
+    }
+
     // MARK: - Documents
 
     private var documentsSection: some View {
@@ -140,6 +229,8 @@ struct LibraryView: View {
                         .buttonStyle(.plain)
                         .contextMenu {
                             Button(role: .destructive) {
+                                reviewStore.removeItems(forDocumentTitle: document.title)
+                                PencilDrawingStore.removeStore(for: document.url)
                                 library.delete(document)
                             } label: {
                                 Label("Elimina", systemImage: "trash")
@@ -190,6 +281,12 @@ struct LibraryView: View {
             return
         }
     }
+
+    private func startReview() {
+        let questions = reviewStore.questionsForReview()
+        guard !questions.isEmpty else { return }
+        reviewLaunch = ReviewLaunch(questions: questions)
+    }
 }
 
 private struct DocumentCard: View {
@@ -232,7 +329,7 @@ private struct DocumentCard: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task(id: document.url) {
+        .task(id: document.modifiedAt) {
             thumbnail = Self.makeThumbnail(for: document.url)
         }
     }
@@ -246,4 +343,5 @@ private struct DocumentCard: View {
 #Preview {
     LibraryView()
         .environment(TeacherStore())
+        .environment(ReviewStore())
 }

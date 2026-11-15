@@ -11,6 +11,8 @@ struct StudySessionView: View {
     let questions: [StudyQuestion]
     let teacher: TeacherProfile
     let documentTitle: String
+    var isReview: Bool = false
+    var onAnswered: ((StudyQuestion, Bool) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -18,6 +20,9 @@ struct StudySessionView: View {
     @State private var selectedIndex: Int?
     @State private var score = 0
     @State private var isFinished = false
+    // Keeps track of the questions already graded in this session, so the
+    // "Riprova" button cannot advance the spaced-repetition schedule twice.
+    @State private var gradedQuestionIDs: Set<UUID> = []
 
     var body: some View {
         NavigationStack {
@@ -29,7 +34,7 @@ struct StudySessionView: View {
                     ContentUnavailableView(
                         "Nessuna domanda",
                         systemImage: "text.badge.xmark",
-                        description: Text("Questo PDF non contiene abbastanza testo per generare le domande.")
+                        description: Text("Questo PDF non contiene testo selezionabile. Se è una scansione, serve un PDF con testo o un OCR.")
                     )
                 } else if isFinished {
                     resultContent
@@ -37,7 +42,7 @@ struct StudySessionView: View {
                     questionContent
                 }
             }
-            .navigationTitle("Interrogazione")
+            .navigationTitle(isReview ? "Ripasso" : "Interrogazione")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
@@ -82,10 +87,14 @@ struct StudySessionView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(teacher.name)
                     .font(.subheadline.weight(.bold))
-                Text("Leggi la domanda con calma e scegli la risposta che ti convince di più.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Text(
+                    isReview
+                        ? "Questo l'avevi sbagliato. Rileggi con calma e riprova."
+                        : "Leggi la domanda con calma e scegli la risposta che ti convince di più."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
             .padding(12)
             .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -116,7 +125,7 @@ struct StudySessionView: View {
 
     private var questionCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(documentTitle)
+            Text(currentQuestion.topic ?? documentTitle)
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -184,8 +193,8 @@ struct StudySessionView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(isAnswerCorrect ? "Esatto!" : "Non ci siamo, ma è così che si impara.")
                     .font(.subheadline.weight(.bold))
-                if !isAnswerCorrect {
-                    Text("La risposta corretta è “\(currentQuestion.choices[currentQuestion.correctIndex])”.")
+                if !isAnswerCorrect, let correctChoice {
+                    Text("La risposta corretta è “\(correctChoice)”.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -280,10 +289,17 @@ struct StudySessionView: View {
         selectedIndex == currentQuestion.correctIndex
     }
 
+    private var correctChoice: String? {
+        guard currentQuestion.choices.indices.contains(currentQuestion.correctIndex) else {
+            return nil
+        }
+        return currentQuestion.choices[currentQuestion.correctIndex]
+    }
+
     private var resultTitle: String {
         let ratio = Double(score) / Double(max(questions.count, 1))
         switch ratio {
-        case 0.8...: return "Ottimo lavoro!"
+        case 0.8...: return isReview ? "Ripasso ottimo!" : "Ottimo lavoro!"
         case 0.5..<0.8: return "Ci siamo quasi"
         default: return "Da ripassare"
         }
@@ -291,6 +307,15 @@ struct StudySessionView: View {
 
     private var resultMessage: String {
         let ratio = Double(score) / Double(max(questions.count, 1))
+
+        if isReview {
+            switch ratio {
+            case 0.8...: return "Hai recuperato quasi tutto. I pochi errori rimasti torneranno più avanti."
+            case 0.5..<0.8: return "Buon passo avanti. Gli errori torneranno tra poco per un altro giro."
+            default: return "Meglio rileggere il PDF: gli errori restano in coda e il Teacher te li riproporrà."
+            }
+        }
+
         switch ratio {
         case 0.8...: return "Hai capito i punti principali di “\(documentTitle)”. Un altro giro e sei pronto."
         case 0.5..<0.8: return "Buona base. Rileggi le pagine indicate e riprova: il Teacher è qui per questo."
@@ -349,8 +374,12 @@ struct StudySessionView: View {
     private func select(_ choiceIndex: Int) {
         guard selectedIndex == nil else { return }
         selectedIndex = choiceIndex
-        if choiceIndex == currentQuestion.correctIndex {
+        let isCorrect = choiceIndex == currentQuestion.correctIndex
+        if isCorrect {
             score += 1
+        }
+        if gradedQuestionIDs.insert(currentQuestion.id).inserted {
+            onAnswered?(currentQuestion, isCorrect)
         }
     }
 

@@ -6,56 +6,60 @@
 //
 
 import Foundation
-import PDFKit
 
-struct StudyQuestion: Identifiable, Hashable {
+struct StudyQuestion: Identifiable, Hashable, Sendable {
     let id: UUID
     let prompt: String
     let choices: [String]
     let correctIndex: Int
     let page: Int?
+    let topic: String?
 
-    init(
+    nonisolated init(
         id: UUID = UUID(),
         prompt: String,
         choices: [String],
         correctIndex: Int,
-        page: Int? = nil
+        page: Int? = nil,
+        topic: String? = nil
     ) {
         self.id = id
         self.prompt = prompt
         self.choices = choices
         self.correctIndex = correctIndex
         self.page = page
+        self.topic = topic
     }
+}
+
+/// Text extracted from one PDF page. Keeping the page number together with the
+/// string lets the generator run off the main thread without PDFKit.
+struct StudyPageText: Sendable {
+    let number: Int
+    let text: String
 }
 
 /// Builds multiple-choice questions directly from the text of a PDF.
 /// The heuristic picks a meaningful keyword from a sentence, hides it, and uses
 /// other keywords from the document as plausible wrong answers.
-enum StudyQuestionGenerator {
+nonisolated enum StudyQuestionGenerator {
     private struct Candidate {
         let sentence: String
         let keyword: String
         let page: Int
     }
 
-    static func makeQuestions(from document: PDFDocument, title: String, limit: Int = 8) -> [StudyQuestion] {
+    static func makeQuestions(from pages: [StudyPageText], limit: Int = 8) -> [StudyQuestion] {
         var candidates: [Candidate] = []
         var keywordPool: [String] = []
 
-        let pageLimit = min(document.pageCount, 40)
-        guard pageLimit > 0 else {
-            return fallbackQuestions(title: title, pageCount: document.pageCount)
-        }
-
-        for pageIndex in 0..<pageLimit {
-            guard let page = document.page(at: pageIndex), let rawText = page.string else { continue }
-            let text = normalize(rawText)
+        for page in pages {
+            let text = normalize(page.text)
+            guard !text.isEmpty else { continue }
 
             for sentence in sentences(in: text) {
                 guard let keyword = keyword(in: sentence) else { continue }
-                candidates.append(Candidate(sentence: sentence, keyword: keyword, page: pageIndex + 1))
+                candidates.append(Candidate(sentence: sentence, keyword: keyword, page: page.number))
                 keywordPool.append(contentsOf: keywords(in: sentence))
             }
         }
@@ -67,14 +71,16 @@ enum StudyQuestionGenerator {
             guard let wordRange = candidate.sentence.range(of: candidate.keyword, options: [.caseInsensitive]) else { continue }
 
             let prompt = candidate.sentence.replacingCharacters(in: wordRange, with: "_____")
-            let uniqueDistractors = Array(
-                Set(
-                    keywordPool.filter {
-                        $0.caseInsensitiveCompare(candidate.keyword) != .orderedSame
-                            && !prompt.localizedCaseInsensitiveContains($0)
-                    }
-                )
-            )
+            var seenDistractors = Set<String>()
+            let uniqueDistractors = keywordPool.filter { word in
+                guard word.caseInsensitiveCompare(candidate.keyword) != .orderedSame,
+                      !prompt.localizedCaseInsensitiveContains(word) else {
+                    return false
+                }
+                // Deduplicate case-insensitively so the same word can't appear
+                // twice (for example "memoria" and "Memoria").
+                return seenDistractors.insert(word.lowercased()).inserted
+            }
 
             guard uniqueDistractors.count >= 3 else { continue }
 
@@ -99,11 +105,6 @@ enum StudyQuestionGenerator {
             if questions.count >= limit { break }
         }
 
-        if questions.count < 4 {
-            let extra = fallbackQuestions(title: title, pageCount: document.pageCount)
-            questions.append(contentsOf: extra.prefix(4 - questions.count))
-        }
-
         return questions
     }
 
@@ -115,7 +116,7 @@ enum StudyQuestionGenerator {
         // Drop a short heading at the top of the page, otherwise the heading
         // gets glued to the first sentence and the cloze becomes confusing.
         if let headingIndex = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
-           isHeading(lines[headingIndex]) {
+           isHeading(in: lines, at: headingIndex) {
             lines.remove(at: headingIndex)
         }
 
@@ -127,15 +128,27 @@ enum StudyQuestionGenerator {
             .replacingOccurrences(of: "  ", with: " ")
     }
 
-    private static func isHeading(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
+    private static func isHeading(in lines: [String], at index: Int) -> Bool {
+        let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
         let wordCount = trimmed.split(separator: " ").count
         let terminalCharacters: Set<Character> = [".", "!", "?", ":", ";", ","]
 
         guard let last = trimmed.last else { return false }
-        return trimmed.count < 90
-            && wordCount <= 12
-            && !terminalCharacters.contains(last)
+        guard trimmed.count < 90,
+              wordCount <= 12,
+              !terminalCharacters.contains(last) else {
+            return false
+        }
+
+        // A wrapped body line continues with a lowercase word. A real heading
+        // is followed by a new sentence that starts with a capital letter (or
+        // by the end of the page).
+        let nextLine = lines[(index + 1)...]
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty }
+
+        guard let nextLine, let first = nextLine.first else { return true }
+        return first.isUppercase
     }
 
     private static func sentences(in text: String) -> [String] {
@@ -160,7 +173,28 @@ enum StudyQuestionGenerator {
             .split(whereSeparator: { !$0.isLetter })
             .map(String.init)
             .filter { $0.count >= 6 && !stopwords.contains($0.lowercased()) }
+            // Using a word that appears only once avoids leaving the answer
+            // visible elsewhere in the sentence.
+            .filter { occurrenceCount(of: $0, in: sentence) == 1 }
             .max { $0.count < $1.count }
+    }
+
+    private static func occurrenceCount(of word: String, in sentence: String) -> Int {
+        var count = 0
+        var searchStart = sentence.startIndex
+
+        while searchStart < sentence.endIndex,
+              let range = sentence.range(
+                  of: word,
+                  options: [.caseInsensitive],
+                  range: searchStart..<sentence.endIndex
+              ) {
+            count += 1
+            if count > 1 { return count }
+            searchStart = range.upperBound
+        }
+
+        return count
     }
 
     private static func keywords(in sentence: String) -> [String] {
@@ -168,52 +202,6 @@ enum StudyQuestionGenerator {
             .split(whereSeparator: { !$0.isLetter })
             .map(String.init)
             .filter { $0.count >= 5 && !stopwords.contains($0.lowercased()) }
-    }
-
-    // MARK: - Fallbacks
-
-    private static func fallbackQuestions(title: String, pageCount: Int) -> [StudyQuestion] {
-        let correctPages = max(pageCount, 1)
-        let pageChoices = [correctPages, correctPages + 2, correctPages + 5, correctPages + 9].shuffled()
-        let pageIndex = pageChoices.firstIndex(of: correctPages) ?? 0
-
-        return [
-            StudyQuestion(
-                prompt: "Quante pagine ha “\(title)”?",
-                choices: pageChoices.map(String.init),
-                correctIndex: pageIndex
-            ),
-            StudyQuestion(
-                prompt: "Qual è la strategia migliore prima di rispondere a una domanda a crocette?",
-                choices: [
-                    "Rileggere la parte del PDF collegata alla domanda",
-                    "Scegliere sempre la risposta più lunga",
-                    "Rispondere a caso e andare avanti",
-                    "Leggere solo il titolo del documento"
-                ],
-                correctIndex: 0
-            ),
-            StudyQuestion(
-                prompt: "Cosa conviene fare dopo aver sbagliato una domanda?",
-                choices: [
-                    "Ignorare l'errore",
-                    "Tornare alla pagina indicata e ripassare quel passaggio",
-                    "Ricomincere il PDF dall'inizio",
-                    "Cambiare documento"
-                ],
-                correctIndex: 1
-            ),
-            StudyQuestion(
-                prompt: "Come si mantiene alta la concentrazione durante lo studio?",
-                choices: [
-                    "Studiando per ore senza pause",
-                    "Alternando sessioni brevi e pause",
-                    "Leggendo tutto la sera prima dell'esame",
-                    "Tenendo il telefono accanto"
-                ],
-                correctIndex: 1
-            )
-        ]
     }
 
     // MARK: - Stopwords

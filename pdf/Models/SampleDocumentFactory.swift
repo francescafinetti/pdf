@@ -45,7 +45,9 @@ enum SampleDocumentFactory {
             at: CGPoint(x: margin, y: margin),
             withAttributes: [
                 .font: UIFont.systemFont(ofSize: 24, weight: .bold),
-                .foregroundColor: UIColor.label
+                // The PDF page is white regardless of the app appearance, so
+                // avoid dynamic colors such as `.label` (white in dark mode).
+                .foregroundColor: UIColor.black
             ]
         )
 
@@ -79,7 +81,7 @@ enum SampleDocumentFactory {
             at: CGPoint(x: margin, y: bounds.height - margin),
             withAttributes: [
                 .font: UIFont.systemFont(ofSize: 10, weight: .medium),
-                .foregroundColor: UIColor.secondaryLabel
+                .foregroundColor: UIColor.darkGray
             ]
         )
     }

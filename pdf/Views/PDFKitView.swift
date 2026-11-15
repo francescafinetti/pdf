@@ -12,18 +12,42 @@ import UIKit
 struct PDFKitView: UIViewRepresentable {
     let controller: PDFEditorController
 
+    final class Coordinator {
+        var wasInMarkupMode = false
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeUIView(context: Context) -> EditorPDFView {
         let view = EditorPDFView()
         view.backgroundColor = .secondarySystemBackground
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
+        view.usePageViewController(false)
         view.autoScales = true
+        // PDFKit asks for page overlays only if the provider is installed
+        // before the document is assigned.
+        view.pageOverlayViewProvider = controller.pencilCoordinator
         view.document = controller.document
 
         controller.attach(view)
-        view.overlay.onFinish = { [weak controller, weak view] points in
+        view.overlay.onTap = { [weak controller, weak view] point in
             guard let controller, let view else { return }
-            controller.handleTouch(points: points, in: view)
+            controller.handleTap(at: point, in: view)
+        }
+        view.overlay.onDragBegan = { [weak controller, weak view] point in
+            guard let controller, let view else { return }
+            controller.beginNoteDrag(at: point, in: view)
+        }
+        view.overlay.onDragChanged = { [weak controller, weak view] point in
+            guard let controller, let view else { return }
+            controller.updateNoteDrag(at: point, in: view)
+        }
+        view.overlay.onDragEnded = { [weak controller, weak view] point in
+            guard let controller, let view else { return }
+            controller.endNoteDrag(at: point, in: view)
         }
 
         return view
@@ -32,10 +56,20 @@ struct PDFKitView: UIViewRepresentable {
     func updateUIView(_ view: EditorPDFView, context: Context) {
         controller.attach(view)
 
+        let coordinator = controller.pencilCoordinator
+        coordinator.toolColor = controller.activeColor
+        coordinator.toolWidth = controller.lineWidth
+        coordinator.drawingTool = controller.pencilTool
+        coordinator.isMarkupEnabled = controller.tool.usesPencilCanvas
+
+        let wantsMarkup = controller.tool.usesPencilCanvas
+        if context.coordinator.wasInMarkupMode != wantsMarkup {
+            view.isInMarkupMode = wantsMarkup
+            view.layoutDocumentView()
+            context.coordinator.wasInMarkupMode = wantsMarkup
+        }
+
         view.overlay.isUserInteractionEnabled = controller.tool.capturesTouches
-        view.overlay.showsPreview = controller.tool == .pen
-        view.overlay.strokeColor = controller.activeColor
-        view.overlay.lineWidth = controller.lineWidth
 
         if view.document !== controller.document {
             view.document = controller.document
@@ -43,7 +77,9 @@ struct PDFKitView: UIViewRepresentable {
     }
 }
 
-/// PDFView with a transparent drawing layer pinned above its content.
+/// PDFView with a transparent layer that owns the eraser and note gestures.
+/// Using recognizers (instead of raw touches) keeps the drag alive even when
+/// PDFKit or the navigation stack would otherwise cancel the touches.
 final class EditorPDFView: PDFView {
     let overlay = DrawingOverlayView()
 
@@ -65,92 +101,90 @@ final class EditorPDFView: PDFView {
     }
 }
 
-/// Captures pencil/finger strokes and forwards them to the editor.
+/// Captures taps and drags for the eraser and note tools with dedicated
+/// recognizers. Raw `touchesBegan/Moved/Ended` can be cancelled by the scroll
+/// view or the navigation stack, which made horizontal eraser drags fail.
 final class DrawingOverlayView: UIView {
-    var onFinish: (([CGPoint]) -> Void)?
-
-    var strokeColor: UIColor = .label {
-        didSet { strokeLayer.strokeColor = strokeColor.cgColor }
-    }
-
-    var lineWidth: CGFloat = 3 {
-        didSet { strokeLayer.lineWidth = lineWidth }
-    }
-
-    var showsPreview = true {
-        didSet { strokeLayer.isHidden = !showsPreview }
-    }
+    var onTap: ((CGPoint) -> Void)?
+    var onDragBegan: ((CGPoint) -> Void)?
+    var onDragChanged: ((CGPoint) -> Void)?
+    var onDragEnded: ((CGPoint) -> Void)?
 
     private var points: [CGPoint] = []
-    private let strokeLayer = CAShapeLayer()
+    private var initialPoint: CGPoint?
+
+    private lazy var panGesture: UIPanGestureRecognizer = {
+        let gesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan))
+        gesture.maximumNumberOfTouches = 1
+        gesture.cancelsTouchesInView = true
+        return gesture
+    }()
+
+    private lazy var tapGesture: UITapGestureRecognizer = {
+        let gesture = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+        gesture.cancelsTouchesInView = true
+        gesture.require(toFail: panGesture)
+        return gesture
+    }()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isUserInteractionEnabled = false
         isMultipleTouchEnabled = false
-
-        strokeLayer.fillColor = UIColor.clear.cgColor
-        strokeLayer.strokeColor = strokeColor.cgColor
-        strokeLayer.lineWidth = lineWidth
-        strokeLayer.lineCap = .round
-        strokeLayer.lineJoin = .round
-        layer.addSublayer(strokeLayer)
+        addGestureRecognizer(panGesture)
+        addGestureRecognizer(tapGesture)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        strokeLayer.frame = bounds
-    }
-
+    /// The pan gesture only begins after a small movement; remembering the
+    /// original touch-down point lets the controller hit-test the note where
+    /// the finger actually landed.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard isUserInteractionEnabled, let point = touches.first?.location(in: self) else { return }
-        points = [point]
-        updatePreview()
+        initialPoint = touches.first?.location(in: self)
     }
 
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard isUserInteractionEnabled, let point = touches.first?.location(in: self) else { return }
-        points.append(point)
-        updatePreview()
-    }
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        let point = gesture.location(in: self)
 
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard isUserInteractionEnabled else { return }
-
-        if let point = touches.first?.location(in: self), points.count <= 1 {
-            // A tap still needs two points to produce a tiny ink dot.
-            points.append(CGPoint(x: point.x + 0.1, y: point.y + 0.1))
+        switch gesture.state {
+        case .began:
+            let start = initialPoint ?? point
+            points = [start, point]
+            onDragBegan?(start)
+            if start != point {
+                onDragChanged?(point)
+            }
+        case .changed:
+            points.append(point)
+            onDragChanged?(point)
+        case .ended:
+            if points.count > 1 {
+                onDragEnded?(point)
+            } else {
+                onTap?(point)
+            }
+            reset()
+        case .cancelled, .failed:
+            if points.count > 1 {
+                onDragEnded?(point)
+            }
+            reset()
+        default:
+            break
         }
-
-        onFinish?(points)
-        reset()
     }
 
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        reset()
-    }
-
-    private func updatePreview() {
-        guard showsPreview, let first = points.first else {
-            strokeLayer.path = nil
-            return
-        }
-
-        let path = UIBezierPath()
-        path.move(to: first)
-        for point in points.dropFirst() {
-            path.addLine(to: point)
-        }
-        strokeLayer.path = path.cgPath
+    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        initialPoint = nil
+        onTap?(gesture.location(in: self))
     }
 
     private func reset() {
         points.removeAll()
-        strokeLayer.path = nil
+        initialPoint = nil
     }
 }

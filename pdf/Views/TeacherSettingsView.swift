@@ -104,7 +104,11 @@ struct TeacherSettingsView: View {
     private func loadPhoto(from item: PhotosPickerItem?) {
         guard let item else { return }
 
-        Task {
+        Task { @MainActor in
+            // Reset the selection so picking the same photo again still
+            // triggers the change handler (for example after removing it).
+            defer { photoItem = nil }
+
             guard let data = try? await item.loadTransferable(type: Data.self),
                   let image = UIImage(data: data),
                   let compressed = image.teacherAvatarData() else { return }
